@@ -25,6 +25,8 @@ export type GridParams = {
   trailUp: number | null;
   /** Price floor. The grid may extend down until the lower limit reaches it. */
   trailDown: number | null;
+  /** Add each positive cycle profit back into the order size. */
+  reinvest: boolean;
 };
 
 export type FillReason = "init" | "grid" | "sl" | "tp" | "trail";
@@ -50,6 +52,21 @@ export type EquityPoint = {
   price: number;
   cash: number;
   btc: number;
+  lower: number;
+  upper: number;
+};
+
+export type TrailMark = {
+  t: number;
+  dir: "up" | "down";
+  lower: number;
+  upper: number;
+  price: number;
+};
+
+export type GridBand = {
+  t: number;
+  levels: number[];
 };
 
 export type BacktestSummary = {
@@ -89,11 +106,14 @@ export type BacktestSummary = {
   trailUpCount: number;
   trailDownCount: number;
   extraCapital: number;
+  reinvested: number;
 };
 
 export type BacktestResult = {
   fills: Fill[];
   equity: EquityPoint[];
+  trails: TrailMark[];
+  bands: GridBand[];
   summary: BacktestSummary;
 };
 
@@ -305,7 +325,10 @@ export function runBacktest(candles: Candle[], params: GridParams): BacktestResu
   let extraCapital = 0;
   let trailUpCount = 0;
   let trailDownCount = 0;
+  let reinvested = 0;
   const fills: Fill[] = [];
+  const trails: TrailMark[] = [];
+  const bands: GridBand[] = [{ t: candles[0].t, levels: [...seed.levels] }];
   const equity: EquityPoint[] = [];
   let qty = 0;
 
@@ -368,6 +391,13 @@ export function runBacktest(candles: Candle[], params: GridParams): BacktestResu
       reason: "grid",
     });
     slots[grid] = { side: "buy", entryPrice: 0, entryQuote: 0, baseQty: 0 };
+    compound(cyclePnl, price);
+  };
+
+  const compound = (pnl: number, at: number) => {
+    if (!params.reinvest || !(pnl > 0) || !(at > 0) || !(grids > 0)) return;
+    qty += pnl / (grids * at);
+    reinvested += pnl;
   };
 
   const liquidate = (price: number, t: number, why: "sl" | "tp") => {
@@ -482,6 +512,7 @@ export function runBacktest(candles: Candle[], params: GridParams): BacktestResu
       basis: slot.entryQuote,
       reason: "trail",
     });
+    compound(cyclePnl, price);
   };
 
   /** OKX trailing up: drop the bottom buy, shift every level up one spacing, buy the new top. */
@@ -514,6 +545,9 @@ export function runBacktest(candles: Candle[], params: GridParams): BacktestResu
       if (!(trailDownFloor < lower)) trailDownFloor = null;
     }
     trailUpCount += 1;
+    const snap = [...levels];
+    bands.push({ t, levels: snap });
+    trails.push({ t, dir: "up", lower: snap[0], upper: snap[snap.length - 1], price });
     return true;
   };
 
@@ -535,6 +569,9 @@ export function runBacktest(candles: Candle[], params: GridParams): BacktestResu
     slots.unshift({ side: "buy", entryPrice: 0, entryQuote: 0, baseQty: 0 });
     buy(0, nextLower, t, "trail");
     trailDownCount += 1;
+    const snap = [...levels];
+    bands.push({ t, levels: snap });
+    trails.push({ t, dir: "down", lower: snap[0], upper: snap[snap.length - 1], price: nextLower });
     return true;
   };
 
@@ -611,7 +648,16 @@ export function runBacktest(candles: Candle[], params: GridParams): BacktestResu
     const price = candle.c;
     const eq = active ? cash + btc * price - extraCapital : investment;
     const hold = active && activationPrice ? holdQty * price : investment;
-    equity.push({ t: candle.t, equity: eq, hold, price, cash: active ? cash : investment, btc });
+    equity.push({
+      t: candle.t,
+      equity: eq,
+      hold,
+      price,
+      cash: active ? cash : investment,
+      btc,
+      lower,
+      upper,
+    });
     if (active) {
       activeBars += 1;
       if (price >= lower && price <= upper) inRange += 1;
@@ -646,6 +692,8 @@ export function runBacktest(candles: Candle[], params: GridParams): BacktestResu
   return {
     fills,
     equity,
+    trails,
+    bands,
     summary: {
       investment,
       finalEquity,
@@ -683,6 +731,113 @@ export function runBacktest(candles: Candle[], params: GridParams): BacktestResu
       trailUpCount,
       trailDownCount,
       extraCapital,
+      reinvested,
     },
   };
+}
+
+export type GridProposal = {
+  id: string;
+  name: string;
+  note: string;
+  lower: number;
+  upper: number;
+  grids: number;
+  mode: GridMode;
+  trailUp: number | null;
+  trailDown: number | null;
+  stopLoss: number | null;
+  takeProfit: number | null;
+  reinvest: boolean;
+};
+
+/** Rules anchored on the entry price only — the range does not look at later prices. */
+export function proposeGrids(entry: number): GridProposal[] {
+  if (!(entry > 0)) return [];
+  const px = (factor: number) => nicePrice(entry * factor);
+  const zone = (down: number, up: number) => ({ lower: px(1 - down), upper: px(1 + up) });
+  const tight = zone(0.08, 0.08);
+  const mid = zone(0.15, 0.18);
+  const wide = zone(0.28, 0.35);
+  return [
+    {
+      id: "tight",
+      name: "Serré au départ",
+      note: "±8 % autour du premier cours. Sans trailing.",
+      ...tight,
+      grids: 24,
+      mode: "arithmetic",
+      trailUp: null,
+      trailDown: null,
+      stopLoss: null,
+      takeProfit: null,
+      reinvest: false,
+    },
+    {
+      id: "balanced",
+      name: "Équilibré au départ",
+      note: "−15 % / +18 %. Posable le premier jour, sans connaître la suite.",
+      ...mid,
+      grids: 16,
+      mode: "arithmetic",
+      trailUp: null,
+      trailDown: null,
+      stopLoss: null,
+      takeProfit: null,
+      reinvest: false,
+    },
+    {
+      id: "wide",
+      name: "Large au départ",
+      note: "−28 % / +35 %, écart géométrique.",
+      ...wide,
+      grids: 12,
+      mode: "geometric",
+      trailUp: null,
+      trailDown: null,
+      stopLoss: null,
+      takeProfit: null,
+      reinvest: false,
+    },
+    {
+      id: "trail-up",
+      name: "Suit la hausse",
+      note: "Même départ équilibré, plafond à 3× le premier cours. Le stop monte avec la grille.",
+      ...mid,
+      grids: 16,
+      mode: "arithmetic",
+      trailUp: px(3),
+      trailDown: null,
+      stopLoss: px(0.7),
+      takeProfit: null,
+      reinvest: false,
+    },
+    {
+      id: "both",
+      name: "Suit les deux sens",
+      note: "Plafond 2,5×, plancher 0,45×. Le capital ajouté en bas est compté.",
+      lower: px(0.8),
+      upper: px(1.25),
+      grids: 14,
+      mode: "arithmetic",
+      trailUp: px(2.5),
+      trailDown: px(0.45),
+      stopLoss: null,
+      takeProfit: null,
+      reinvest: false,
+    },
+    {
+      id: "compound",
+      name: "Profits réinvestis",
+      note: "Zone équilibrée, plafond 2,2×. Chaque gain augmente la taille des ordres.",
+      ...mid,
+      grids: 16,
+      mode: "arithmetic",
+      trailUp: px(2.2),
+      trailDown: null,
+      stopLoss: null,
+      takeProfit: null,
+      reinvest: true,
+    },
+  ];
 }

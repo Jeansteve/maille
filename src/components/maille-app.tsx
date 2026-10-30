@@ -8,6 +8,7 @@ import {
   Line,
   ReferenceLine,
   ResponsiveContainer,
+  Scatter,
   Tooltip,
   XAxis,
   YAxis,
@@ -19,6 +20,7 @@ import {
   suggestGridCount,
   suggestRange,
   validateParams,
+  proposeGrids,
   type BacktestResult,
   type BacktestSummary,
   type Fill,
@@ -96,9 +98,15 @@ type Params = {
   takeProfit: number | null;
   trailUp: number | null;
   trailDown: number | null;
+  reinvest: boolean;
 };
 
 type Spec = { bar: OkxBar; days: number };
+
+type AppliedGrid = Pick<
+  Params,
+  "lower" | "upper" | "grids" | "mode" | "trailUp" | "trailDown" | "stopLoss" | "takeProfit" | "reinvest"
+>;
 
 const DEFAULT_PARAMS: Params = {
   lower: 70_000,
@@ -111,6 +119,7 @@ const DEFAULT_PARAMS: Params = {
   takeProfit: null,
   trailUp: null,
   trailDown: null,
+  reinvest: false,
 };
 
 const DEFAULT_SPEC: Spec = { bar: "1D", days: 1460 };
@@ -140,6 +149,7 @@ function toGrid(params: Params): GridParams {
     takeProfit: params.takeProfit,
     trailUp: params.trailUp,
     trailDown: params.trailDown,
+    reinvest: params.reinvest,
   };
 }
 
@@ -157,6 +167,7 @@ function sanitizeParams(input: unknown): Params | null {
     takeProfit: raw.takeProfit == null ? null : Number(raw.takeProfit),
     trailUp: raw.trailUp == null ? null : Number(raw.trailUp),
     trailDown: raw.trailDown == null ? null : Number(raw.trailDown),
+    reinvest: raw.reinvest === true,
   };
   return validateParams(toGrid(params)) ? null : params;
 }
@@ -438,6 +449,9 @@ export function MailleApp() {
                   if (n != null && n >= 0 && n < 5) patch({ feePct: n }, false);
                 }}
               />
+              <SegButton pressed={params.reinvest} onClick={() => patch({ reinvest: !params.reinvest }, false)}>
+                {params.reinvest ? "Profits réinvestis" : "Réinvestir les profits"}
+              </SegButton>
             </div>
             <div className="mt-4 border-t border-line pt-4">
               <h3 className="text-xs font-medium tracking-wide text-muted uppercase">Stop, objectif et trailing</h3>
@@ -533,7 +547,8 @@ export function MailleApp() {
                 Trailing haut : quand le cours dépasse le haut de grille, l'achat le plus bas est annulé et la grille
                 monte d'un cran, jusqu'au plafond. Le stop et le plancher du trailing bas montent avec elle.
                 L'objectif reste fixe. Trailing bas : la grille s'allonge d'un cran vers le plancher, le haut ne
-                bouge pas, et le capital manquant est compté à part.
+                bouge pas, et le capital manquant est compté à part. Réinvestir les profits augmente la taille des
+                ordres après chaque cycle gagnant.
               </p>
             </div>
           </details>
@@ -547,6 +562,10 @@ export function MailleApp() {
             validation={validation}
             result={result}
             feeRate={params.feePct / 100}
+            onApply={(next) => {
+              setFit("custom");
+              setParams((current) => ({ ...current, ...next }));
+            }}
             onRetry={() => setReloadKey((n) => n + 1)}
           />
         </section>
@@ -739,6 +758,7 @@ function Results({
   validation,
   result,
   feeRate,
+  onApply,
   onRetry,
 }: {
   pack: CandlePack | null;
@@ -747,6 +767,7 @@ function Results({
   validation: string | null;
   result: BacktestResult | null;
   feeRate: number;
+  onApply: (next: AppliedGrid) => void;
   onRetry: () => void;
 }) {
   if (!pack && loading) {
@@ -781,7 +802,7 @@ function Results({
     );
   }
   if (!result || !pack) return null;
-  return <Report pack={pack} result={result} loading={loading} feeRate={feeRate} />;
+  return <Report pack={pack} result={result} loading={loading} feeRate={feeRate} onApply={onApply} />;
 }
 
 function Report({
@@ -789,15 +810,41 @@ function Report({
   result,
   loading,
   feeRate,
+  onApply,
 }: {
   pack: CandlePack;
   result: BacktestResult;
   loading: boolean;
   feeRate: number;
+  onApply: (next: AppliedGrid) => void;
 }) {
   const { summary } = result;
   const [tab, setTab] = useState<"price" | "equity" | "months">("price");
+  const [cursor, setCursor] = useState(Number.MAX_SAFE_INTEGER);
+  const [playing, setPlaying] = useState(false);
   const sells = result.fills.filter((fill) => fill.reason === "grid" && fill.side === "sell").slice().reverse();
+  const length = result.equity.length;
+  const frame = result.equity[Math.min(cursor, Math.max(0, length - 1))];
+
+  useEffect(() => {
+    setCursor(Math.max(0, length - 1));
+    setPlaying(false);
+  }, [result, length]);
+
+  useEffect(() => {
+    if (!playing) return;
+    const step = Math.max(1, Math.round(length / 280));
+    const id = window.setInterval(() => {
+      setCursor((current) => {
+        if (current >= length - 1) {
+          setPlaying(false);
+          return length - 1;
+        }
+        return Math.min(length - 1, current + step);
+      });
+    }, 40);
+    return () => window.clearInterval(id);
+  }, [playing, length]);
 
   return (
     <>
@@ -840,6 +887,7 @@ function Report({
             value={summary.trailDownCount ? summary.trailDownCount.toLocaleString("fr-FR") : "0"}
           />
           <Stat label="Capital ajouté" value={usdt(summary.extraCapital)} />
+          {summary.reinvested > 0 ? <Stat label="Réinvesti" value={usdt(summary.reinvested)} /> : null}
         </div>
         <dl className="mt-4 grid grid-cols-2 gap-x-4 gap-y-2 text-sm md:grid-cols-3">
           <Fact label="Équité finale" value={usdt(summary.finalEquity)} />
@@ -853,6 +901,8 @@ function Report({
           />
         </dl>
       </div>
+
+      <Proposals candles={pack.candles} investment={summary.investment} feeRate={feeRate} onApply={onApply} />
 
       <div className="rounded-lg border border-line bg-panel p-4">
         <div className="flex flex-wrap gap-2">
@@ -873,7 +923,13 @@ function Report({
                 <span className="inline-block h-2 w-2 rounded-full bg-gold" /> Cours de clôture
               </span>
               <span className="flex items-center gap-2">
-                <span className="inline-block h-px w-4 bg-gold" /> Niveaux de grille
+                <span className="inline-block h-px w-4 bg-gold" /> Niveaux à cette date
+              </span>
+              <span className="flex items-center gap-2">
+                <span className="inline-block h-2 w-2 rounded-full bg-up" /> Trailing haut
+              </span>
+              <span className="flex items-center gap-2">
+                <span className="inline-block h-2 w-2 rounded-full bg-down" /> Trailing bas
               </span>
             </>
           ) : tab === "equity" ? (
@@ -889,9 +945,47 @@ function Report({
             <span>Profits réalisés des cycles bouclés, par mois UTC.</span>
           )}
         </div>
+        {tab === "price" && frame ? (
+          <div className="mt-3 flex flex-wrap items-center gap-3">
+            <button
+              type="button"
+              className="h-11 rounded-lg border border-line px-3 text-sm text-fg hover:border-gold"
+              onClick={() => {
+                if (playing) {
+                  setPlaying(false);
+                  return;
+                }
+                setCursor((current) => (current >= length - 1 ? 0 : current));
+                setPlaying(true);
+              }}
+            >
+              {playing ? "Pause" : "Lecture"}
+            </button>
+            <input
+              className="min-w-0 flex-1"
+              type="range"
+              min={0}
+              max={Math.max(0, length - 1)}
+              step={1}
+              value={Math.min(cursor, Math.max(0, length - 1))}
+              suppressHydrationWarning
+              aria-label="Avancer dans le temps"
+              onChange={(event) => {
+                setPlaying(false);
+                setCursor(Number(event.target.value));
+              }}
+            />
+            <div className="text-xs text-muted tabular-nums">
+              <div>{pack.bar === "1D" ? dayLabel(frame.t) : stampLabel(frame.t)}</div>
+              <div>
+                Grille {price(frame.lower)} – {price(frame.upper)}
+              </div>
+            </div>
+          </div>
+        ) : null}
         <div className="mt-2 h-64 sm:h-80">
           {tab === "price" ? (
-            <PriceChart result={result} bar={pack.bar} />
+            <PriceChart result={result} bar={pack.bar} at={frame?.t ?? 0} />
           ) : tab === "equity" ? (
             <EquityChart result={result} bar={pack.bar} />
           ) : (
@@ -900,14 +994,16 @@ function Report({
         </div>
       </div>
 
-      <div className="rounded-lg border border-line bg-panel p-4">
-        <h2 className="text-xs font-medium tracking-wide text-muted uppercase">Cycles bouclés</h2>
+      <details className="rounded-lg border border-line bg-panel p-4">
+        <summary className="cursor-pointer text-xs font-medium tracking-wide text-muted uppercase">
+          Cycles bouclés · {sells.length.toLocaleString("fr-FR")}
+        </summary>
         {sells.length === 0 ? (
           <p className="mt-3 text-sm text-muted">Aucun aller-retour sur cette fenêtre.</p>
         ) : (
           <CycleTable sells={sells.slice(0, 80)} total={sells.length} feeRate={feeRate} />
         )}
-      </div>
+      </details>
     </>
   );
 }
@@ -984,11 +1080,114 @@ function ChartTip({
   );
 }
 
-function PriceChart({ result, bar }: { result: BacktestResult; bar: OkxBar }) {
+function Proposals({
+  candles,
+  investment,
+  feeRate,
+  onApply,
+}: {
+  candles: CandlePack["candles"];
+  investment: number;
+  feeRate: number;
+  onApply: (next: AppliedGrid) => void;
+}) {
+  const rows = useMemo(() => {
+    const entry = candles[0]?.c;
+    if (!entry) return [];
+    const ranked = proposeGrids(entry).flatMap((proposal) => {
+      const ran = runBacktest(candles, {
+        lower: proposal.lower,
+        upper: proposal.upper,
+        grids: proposal.grids,
+        mode: proposal.mode,
+        investment,
+        feeRate,
+        stopLoss: proposal.stopLoss,
+        takeProfit: proposal.takeProfit,
+        trailUp: proposal.trailUp,
+        trailDown: proposal.trailDown,
+        reinvest: proposal.reinvest,
+      });
+      if ("error" in ran) return [];
+      return [{ proposal, summary: ran.summary }];
+    });
+    ranked.sort((a, b) => b.summary.alpha - a.summary.alpha);
+    return ranked;
+  }, [candles, investment, feeRate]);
+  const first = candles[0];
+  if (!rows.length || !first) return null;
+  const best = rows[0].proposal.id;
+  return (
+    <section className="rounded-lg border border-line bg-panel p-4">
+      <h2 className="text-xs font-medium tracking-wide text-muted uppercase">Propositions</h2>
+      <p className="mt-1 text-sm text-muted">
+        Calées sur le cours du {dayLabel(first.t)} ({price(first.c)} USDT). La zone ne regarde pas le futur. Le
+        classement rejoue toute la fenêtre : c'est le backtest, pas une prévision.
+      </p>
+      <div className="mt-3 grid gap-2">
+        {rows.map(({ proposal, summary }) => (
+          <button
+            key={proposal.id}
+            type="button"
+            onClick={() =>
+              onApply({
+                lower: proposal.lower,
+                upper: proposal.upper,
+                grids: proposal.grids,
+                mode: proposal.mode,
+                trailUp: proposal.trailUp,
+                trailDown: proposal.trailDown,
+                stopLoss: proposal.stopLoss,
+                takeProfit: proposal.takeProfit,
+                reinvest: proposal.reinvest,
+              })
+            }
+            className={`rounded-lg border px-3 py-2 text-left ${
+              proposal.id === best ? "border-gold bg-panel-2" : "border-line bg-ink hover:border-muted"
+            }`}
+          >
+            <span className="flex flex-wrap items-baseline justify-between gap-2">
+              <span className="text-sm text-fg">
+                {proposal.name}
+                {proposal.id === best ? <span className="ml-2 text-xs text-gold">meilleur écart</span> : null}
+              </span>
+              <span className={`text-sm tabular-nums ${summary.alpha >= 0 ? "text-up" : "text-down"}`}>
+                {pctRatio(summary.roi)} · écart {signedUsdt(summary.alpha)}
+              </span>
+            </span>
+            <span className="mt-1 block text-xs text-muted">
+              {proposal.note} Drawdown {pctRatio(summary.maxDrawdown, false)}.
+            </span>
+          </button>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function bandAt(result: BacktestResult, t: number): number[] {
+  let chosen = result.bands[0]?.levels ?? result.summary.levels;
+  for (const band of result.bands) {
+    if (band.t <= t) chosen = band.levels;
+    else break;
+  }
+  return chosen;
+}
+
+function PriceChart({ result, bar, at }: { result: BacktestResult; bar: OkxBar; at: number }) {
   const data = useMemo(
     () => downsample(result.equity.map((point) => ({ t: point.t, c: point.price })), 480),
     [result],
   );
+  const shown = useMemo(() => {
+    const levels = bandAt(result, at);
+    const stride = Math.max(1, Math.ceil(levels.length / 18));
+    return levels.flatMap((level, index) => {
+      const edge = index === 0 || index === levels.length - 1;
+      if (!edge && index % stride !== 0) return [];
+      return [{ level, edge }];
+    });
+  }, [result, at]);
   const [yMin, yMax] = useMemo(() => {
     let min = Infinity;
     let max = -Infinity;
@@ -996,18 +1195,19 @@ function PriceChart({ result, bar }: { result: BacktestResult; bar: OkxBar }) {
       if (row.c < min) min = row.c;
       if (row.c > max) max = row.c;
     }
-    const pad = (max - min) * 0.08 || max * 0.01;
+    for (const band of result.bands) {
+      const lo = band.levels[0];
+      const hi = band.levels[band.levels.length - 1];
+      if (lo < min) min = lo;
+      if (hi > max) max = hi;
+    }
+    const pad = (max - min) * 0.06 || max * 0.01;
     return [min - pad, max + pad];
-  }, [data]);
-  const levels = useMemo(() => {
-    const stride = Math.max(1, Math.ceil(result.summary.levels.length / 24));
-    return result.summary.levels.flatMap((level, index) => {
-      const edge = index === 0 || index === result.summary.levels.length - 1;
-      if (!edge && index % stride !== 0) return [];
-      if (level < yMin || level > yMax) return [];
-      return [{ level, edge }];
-    });
-  }, [result, yMin, yMax]);
+  }, [data, result.bands]);
+  const upMarks = result.trails.filter((mark) => mark.dir === "up" && mark.t <= at).map((mark) => ({ t: mark.t, c: mark.price }));
+  const downMarks = result.trails
+    .filter((mark) => mark.dir === "down" && mark.t <= at)
+    .map((mark) => ({ t: mark.t, c: mark.price }));
   return (
     <ResponsiveContainer width="100%" height="100%">
       <ComposedChart data={data} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
@@ -1029,15 +1229,16 @@ function PriceChart({ result, bar }: { result: BacktestResult; bar: OkxBar }) {
           width={56}
         />
         <Tooltip content={(props) => <ChartTip {...tipOf(props)} kind="price" bar={bar} />} />
-        {levels.map((row) => (
+        {shown.map((row) => (
           <ReferenceLine
             key={row.level}
             y={row.level}
             stroke="var(--color-gold)"
-            strokeOpacity={row.edge ? 0.9 : 0.55}
+            strokeOpacity={row.edge ? 0.9 : 0.4}
             strokeDasharray={row.edge ? undefined : "3 4"}
           />
         ))}
+        <ReferenceLine x={at} stroke="var(--color-fg)" strokeOpacity={0.65} />
         <Line
           type="monotone"
           dataKey="c"
@@ -1047,6 +1248,8 @@ function PriceChart({ result, bar }: { result: BacktestResult; bar: OkxBar }) {
           strokeWidth={1.6}
           isAnimationActive={false}
         />
+        <Scatter data={upMarks} dataKey="c" name="Trailing haut" fill="var(--color-up)" isAnimationActive={false} />
+        <Scatter data={downMarks} dataKey="c" name="Trailing bas" fill="var(--color-down)" isAnimationActive={false} />
       </ComposedChart>
     </ResponsiveContainer>
   );

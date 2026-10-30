@@ -13,6 +13,7 @@ const base = (over: Partial<GridParams> = {}): GridParams => ({
   takeProfit: null,
   trailUp: null,
   trailDown: null,
+  reinvest: false,
   ...over,
 });
 
@@ -96,6 +97,9 @@ test("trailing up shifts the grid and the stop, and leaves the take-profit fixed
   assert.ok(result.summary.levels[0] > 100);
   assert.ok(result.summary.levels.at(-1)! > 120);
   assert.equal(result.summary.stopped, null);
+  assert.ok(result.trails.length >= 1);
+  assert.equal(result.trails[0].dir, "up");
+  assert.ok(result.bands.length > 1);
 });
 
 test("trailing down extends the floor and records the extra capital", () => {
@@ -109,6 +113,21 @@ test("trailing down extends the floor and records the extra capital", () => {
   assert.ok(result.summary.levels[0] < 100);
   assert.equal(result.summary.levels.at(-1), 120);
   assert.ok(result.summary.extraCapital > 0);
+});
+
+test("reinvest grows the order size after a profitable cycle", () => {
+  const candles: Candle[] = [
+    { t: 0, o: 110, h: 110, l: 110, c: 110 },
+    { t: 1, o: 110, h: 120, l: 110, c: 120 },
+    { t: 2, o: 120, h: 120, l: 100, c: 100 },
+    { t: 3, o: 100, h: 120, l: 100, c: 120 },
+  ];
+  const plain = runBacktest(candles, base());
+  const compound = runBacktest(candles, base({ reinvest: true }));
+  assert.ok(!("error" in plain) && !("error" in compound));
+  assert.ok(compound.summary.reinvested > 0);
+  assert.ok(compound.summary.qty > plain.summary.qty);
+  assert.ok(compound.summary.gridPnl > plain.summary.gridPnl);
 });
 
 test("fees can make a tight grid cycle negative", () => {
