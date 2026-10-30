@@ -11,6 +11,8 @@ const base = (over: Partial<GridParams> = {}): GridParams => ({
   feeRate: 0,
   stopLoss: null,
   takeProfit: null,
+  trailUp: null,
+  trailDown: null,
   ...over,
 });
 
@@ -78,6 +80,35 @@ test("stop below the range liquidates and freezes the book", () => {
   assert.equal(result.summary.finalBtc, 0);
   assert.ok(result.summary.finalEquity < 1000);
   assert.equal(result.fills.filter((fill) => fill.reason === "grid" && fill.side === "sell").length, 0);
+});
+
+test("trailing up shifts the grid and the stop, and leaves the take-profit fixed", () => {
+  const candles: Candle[] = [
+    { t: 0, o: 110, h: 110, l: 110, c: 110 },
+    { t: 1, o: 110, h: 140, l: 110, c: 135 },
+  ];
+  const result = runBacktest(
+    candles,
+    base({ trailUp: 150, stopLoss: 90, takeProfit: 160 }),
+  );
+  assert.ok(!("error" in result));
+  assert.ok(result.summary.trailUpCount >= 1);
+  assert.ok(result.summary.levels[0] > 100);
+  assert.ok(result.summary.levels.at(-1)! > 120);
+  assert.equal(result.summary.stopped, null);
+});
+
+test("trailing down extends the floor and records the extra capital", () => {
+  const candles: Candle[] = [
+    { t: 0, o: 110, h: 110, l: 110, c: 110 },
+    { t: 1, o: 110, h: 110, l: 80, c: 85 },
+  ];
+  const result = runBacktest(candles, base({ trailDown: 80, investment: 1000 }));
+  assert.ok(!("error" in result));
+  assert.ok(result.summary.trailDownCount >= 1);
+  assert.ok(result.summary.levels[0] < 100);
+  assert.equal(result.summary.levels.at(-1), 120);
+  assert.ok(result.summary.extraCapital > 0);
 });
 
 test("fees can make a tight grid cycle negative", () => {

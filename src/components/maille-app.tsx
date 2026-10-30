@@ -40,29 +40,32 @@ import {
 } from "@/lib/format";
 import { fetchOkxCandles, type CandlePack, type OkxBar } from "@/lib/okx";
 
-const STORAGE_KEY = "maille-grid-v1";
+const STORAGE_KEY = "maille-grid-v2";
 
 const SPANS: Record<OkxBar, { days: number; label: string }[]> = {
   "15m": [
     { days: 7, label: "7 j" },
     { days: 14, label: "14 j" },
-    { days: 21, label: "21 j" },
-  ],
-  "1H": [
-    { days: 14, label: "14 j" },
     { days: 30, label: "30 j" },
-    { days: 60, label: "60 j" },
     { days: 90, label: "90 j" },
   ],
-  "4H": [
+  "1H": [
+    { days: 30, label: "30 j" },
     { days: 90, label: "90 j" },
     { days: 180, label: "6 mois" },
     { days: 365, label: "1 an" },
   ],
-  "1D": [
+  "4H": [
+    { days: 180, label: "6 mois" },
     { days: 365, label: "1 an" },
     { days: 730, label: "2 ans" },
     { days: 1460, label: "4 ans" },
+  ],
+  "1D": [
+    { days: 730, label: "2 ans" },
+    { days: 1460, label: "4 ans" },
+    { days: 2190, label: "6 ans" },
+    { days: 3400, label: "9 ans" },
   ],
 };
 
@@ -91,6 +94,8 @@ type Params = {
   feePct: number;
   stopLoss: number | null;
   takeProfit: number | null;
+  trailUp: number | null;
+  trailDown: number | null;
 };
 
 type Spec = { bar: OkxBar; days: number };
@@ -104,12 +109,14 @@ const DEFAULT_PARAMS: Params = {
   feePct: 0.08,
   stopLoss: null,
   takeProfit: null,
+  trailUp: null,
+  trailDown: null,
 };
 
-const DEFAULT_SPEC: Spec = { bar: "1H", days: 60 };
+const DEFAULT_SPEC: Spec = { bar: "1D", days: 1460 };
 
 function limitFor(spec: Spec): number {
-  return Math.max(80, Math.min(2500, Math.round((spec.days * 86_400_000) / BAR_MS[spec.bar])));
+  return Math.max(80, Math.min(10_000, Math.round((spec.days * 86_400_000) / BAR_MS[spec.bar])));
 }
 
 function normalizeSpec(spec: Spec): Spec {
@@ -131,6 +138,8 @@ function toGrid(params: Params): GridParams {
     feeRate: params.feePct / 100,
     stopLoss: params.stopLoss,
     takeProfit: params.takeProfit,
+    trailUp: params.trailUp,
+    trailDown: params.trailDown,
   };
 }
 
@@ -146,6 +155,8 @@ function sanitizeParams(input: unknown): Params | null {
     feePct: Number(raw.feePct),
     stopLoss: raw.stopLoss == null ? null : Number(raw.stopLoss),
     takeProfit: raw.takeProfit == null ? null : Number(raw.takeProfit),
+    trailUp: raw.trailUp == null ? null : Number(raw.trailUp),
+    trailDown: raw.trailDown == null ? null : Number(raw.trailDown),
   };
   return validateParams(toGrid(params)) ? null : params;
 }
@@ -300,7 +311,7 @@ export function MailleApp() {
                 </SegButton>
               ))}
             </div>
-            <div className="mt-2 grid grid-cols-3 gap-2">
+            <div className="mt-2 grid grid-cols-4 gap-2">
               {SPANS[spec.bar].map((span) => (
                 <SegButton
                   key={span.days}
@@ -319,6 +330,9 @@ export function MailleApp() {
             </p>
             {pack && pack.candles.length < pack.requested * 0.85 ? (
               <p className="mt-1 text-xs text-muted">L'historique OKX est plus court que la fenêtre demandée.</p>
+            ) : null}
+            {spec.bar === "1D" ? (
+              <p className="mt-1 text-xs text-muted">Le journalier BTC-USDT remonte à octobre 2017.</p>
             ) : null}
             <button
               type="button"
@@ -425,25 +439,77 @@ export function MailleApp() {
                 }}
               />
             </div>
-            <details className="mt-3">
-              <summary className="cursor-pointer text-sm text-muted">Stop et objectif</summary>
+            <div className="mt-4 border-t border-line pt-4">
+              <h3 className="text-xs font-medium tracking-wide text-muted uppercase">Stop, objectif et trailing</h3>
               <div className="mt-3 grid gap-3">
+                <NumField
+                  label="Prise de profit"
+                  value={params.takeProfit}
+                  suffix="USDT"
+                  hint="Au-dessus du haut de grille. Le bot vend tout le BTC et s'arrête. Ce prix ne bouge pas."
+                  onCommit={(n) => patch({ takeProfit: n }, false)}
+                />
                 <NumField
                   label="Stop loss"
                   value={params.stopLoss}
                   suffix="USDT"
-                  hint="Sous le bas de grille. Liquide le BTC et arrête le bot."
+                  hint="Sous le bas de grille. Le bot vend tout le BTC et s'arrête. Il monte avec le trailing haut."
                   onCommit={(n) => patch({ stopLoss: n }, false)}
                 />
-                <NumField
-                  label="Objectif"
-                  value={params.takeProfit}
-                  suffix="USDT"
-                  hint="Au-dessus du haut de grille. Même sortie, dans l'autre sens."
-                  onCommit={(n) => patch({ takeProfit: n }, false)}
-                />
+                <div className="grid grid-cols-2 gap-2">
+                  <SegButton
+                    pressed={params.trailUp != null}
+                    onClick={() =>
+                      patch(
+                        {
+                          trailUp:
+                            params.trailUp == null ? Math.round(params.upper * 1.5) : null,
+                        },
+                        false,
+                      )
+                    }
+                  >
+                    Trailing haut
+                  </SegButton>
+                  <SegButton
+                    pressed={params.trailDown != null}
+                    onClick={() =>
+                      patch(
+                        {
+                          trailDown:
+                            params.trailDown == null ? Math.round(params.lower * 0.7) : null,
+                        },
+                        false,
+                      )
+                    }
+                  >
+                    Trailing bas
+                  </SegButton>
+                </div>
+                {params.trailUp != null ? (
+                  <NumField
+                    label="Plafond trailing haut"
+                    value={params.trailUp}
+                    suffix="USDT"
+                    hint="Si le cours dépasse le haut, la grille entière monte d'un cran, jusqu'à ce plafond."
+                    onCommit={(n) => {
+                      if (n != null && n > 0) patch({ trailUp: n }, false);
+                    }}
+                  />
+                ) : null}
+                {params.trailDown != null ? (
+                  <NumField
+                    label="Plancher trailing bas"
+                    value={params.trailDown}
+                    suffix="USDT"
+                    hint="Si le cours passe sous le bas, la grille s'allonge vers le bas, sans dépasser ce plancher. Le capital manquant est ajouté."
+                    onCommit={(n) => {
+                      if (n != null && n > 0) patch({ trailDown: n }, false);
+                    }}
+                  />
+                ) : null}
               </div>
-            </details>
+            </div>
           </section>
 
           <details className="rounded-lg border border-line bg-panel p-4 text-sm text-muted">
@@ -460,8 +526,14 @@ export function MailleApp() {
               </p>
               <p>
                 Chaque bougie est lue dans l'ordre ouverture, mèche adverse, mèche favorable, clôture. Un seul
-                aller-retour intra-bougie est donc compté. Hors zone, aucun nouvel ordre. La position restante est
-                marquée au dernier cours. Les frais sortent en BTC à l'achat et en USDT à la vente.
+                aller-retour intra-bougie est donc compté. Hors zone, aucun nouvel ordre, sauf trailing. La position
+                restante est marquée au dernier cours. Les frais sortent en BTC à l'achat et en USDT à la vente.
+              </p>
+              <p>
+                Trailing haut : quand le cours dépasse le haut de grille, l'achat le plus bas est annulé et la grille
+                monte d'un cran, jusqu'au plafond. Le stop et le plancher du trailing bas montent avec elle.
+                L'objectif reste fixe. Trailing bas : la grille s'allonge d'un cran vers le plancher, le haut ne
+                bouge pas, et le capital manquant est compté à part.
               </p>
             </div>
           </details>
@@ -759,6 +831,15 @@ function Report({
             tone={summary.maxDrawdown > 0 ? "down" : undefined}
           />
           <Stat label="Frais" value={usdt(summary.fees)} />
+          <Stat
+            label="Trailing haut"
+            value={summary.trailUpCount ? summary.trailUpCount.toLocaleString("fr-FR") : "0"}
+          />
+          <Stat
+            label="Trailing bas"
+            value={summary.trailDownCount ? summary.trailDownCount.toLocaleString("fr-FR") : "0"}
+          />
+          <Stat label="Capital ajouté" value={usdt(summary.extraCapital)} />
         </div>
         <dl className="mt-4 grid grid-cols-2 gap-x-4 gap-y-2 text-sm md:grid-cols-3">
           <Fact label="Équité finale" value={usdt(summary.finalEquity)} />

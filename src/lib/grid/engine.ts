@@ -21,9 +21,13 @@ export type GridParams = {
   feeRate: number;
   stopLoss: number | null;
   takeProfit: number | null;
+  /** Price cap. The whole grid may shift up until the upper limit reaches it. */
+  trailUp: number | null;
+  /** Price floor. The grid may extend down until the lower limit reaches it. */
+  trailDown: number | null;
 };
 
-export type FillReason = "init" | "grid" | "sl" | "tp";
+export type FillReason = "init" | "grid" | "sl" | "tp" | "trail";
 
 export type Fill = {
   t: number;
@@ -82,6 +86,9 @@ export type BacktestSummary = {
   maxGridReturn: number;
   openSlots: number;
   levels: number[];
+  trailUpCount: number;
+  trailDownCount: number;
+  extraCapital: number;
 };
 
 export type BacktestResult = {
@@ -106,6 +113,12 @@ export function validateParams(p: GridParams): string | null {
   }
   if (p.stopLoss != null && p.takeProfit != null && p.stopLoss >= p.takeProfit) {
     return "Le stop doit rester sous l'objectif.";
+  }
+  if (p.trailUp != null && !(p.trailUp > p.upper)) {
+    return "Le plafond du trailing haut doit être au-dessus du haut de grille.";
+  }
+  if (p.trailDown != null && !(p.trailDown > 0 && p.trailDown < p.lower)) {
+    return "Le plancher du trailing bas doit être sous le bas de grille.";
   }
   return null;
 }
@@ -253,7 +266,16 @@ export function runBacktest(candles: Candle[], params: GridParams): BacktestResu
   if (problem) return { error: problem };
   if (candles.length < 2) return { error: "Pas assez de bougies pour simuler." };
 
-  const { lower, upper, grids, investment, feeRate } = params;
+  const { investment, feeRate } = params;
+  let grids = params.grids;
+  let lower = params.lower;
+  let upper = params.upper;
+  let stopLoss = params.stopLoss;
+  const takeProfit = params.takeProfit;
+  let trailUpCap = params.trailUp;
+  let trailDownFloor = params.trailDown;
+  const arithStep = (params.upper - params.lower) / params.grids;
+  const geoRatio = Math.pow(params.upper / params.lower, 1 / params.grids);
   const planAt = (price: number) => allocate(params, price);
   const seed = planAt((lower + upper) / 2);
   if (!seed) return { error: "Grille impossible à construire." };
@@ -280,6 +302,9 @@ export function runBacktest(candles: Candle[], params: GridParams): BacktestResu
   let wins = 0;
   let buyCount = 0;
   let sellCount = 0;
+  let extraCapital = 0;
+  let trailUpCount = 0;
+  let trailDownCount = 0;
   const fills: Fill[] = [];
   const equity: EquityPoint[] = [];
   let qty = 0;
@@ -397,8 +422,8 @@ export function runBacktest(candles: Candle[], params: GridParams): BacktestResu
         const px = levels[i + 1];
         if (px > from && px <= to) events.push({ px, kind: "sell", grid: i });
       }
-      if (params.takeProfit != null && params.takeProfit > from && params.takeProfit <= to) {
-        events.push({ px: params.takeProfit, kind: "tp", grid: -1 });
+      if (takeProfit != null && takeProfit > from && takeProfit <= to) {
+        events.push({ px: takeProfit, kind: "tp", grid: -1 });
       }
       events.sort((a, b) => a.px - b.px || (a.kind === "tp" ? 1 : -1));
       for (const event of events) {
@@ -414,8 +439,8 @@ export function runBacktest(candles: Candle[], params: GridParams): BacktestResu
       const px = levels[i];
       if (px < from && px >= to) events.push({ px, kind: "buy", grid: i });
     }
-    if (params.stopLoss != null && params.stopLoss < from && params.stopLoss >= to) {
-      events.push({ px: params.stopLoss, kind: "sl", grid: -1 });
+    if (stopLoss != null && stopLoss < from && stopLoss >= to) {
+      events.push({ px: stopLoss, kind: "sl", grid: -1 });
     }
     events.sort((a, b) => b.px - a.px || (a.kind === "sl" ? 1 : -1));
     for (const event of events) {
@@ -430,6 +455,121 @@ export function runBacktest(candles: Candle[], params: GridParams): BacktestResu
     if (a < lower && b > a && b >= lower) return lower;
     if (a >= upper && b < a && b < upper) return upper;
     return null;
+  };
+
+  const closeDropped = (slot: Slot, price: number, t: number) => {
+    if (slot.side !== "sell" || !(slot.baseQty > 0)) return;
+    const gross = slot.baseQty * price;
+    const feeQuote = gross * feeRate;
+    const proceeds = gross - feeQuote;
+    cash += proceeds;
+    btc -= slot.baseQty;
+    fees += feeQuote;
+    const cyclePnl = proceeds - slot.entryQuote;
+    gridPnl += cyclePnl;
+    cycles += 1;
+    if (cyclePnl > 0) wins += 1;
+    sellCount += 1;
+    fills.push({
+      t,
+      side: "sell",
+      price,
+      qty: slot.baseQty,
+      quote: proceeds,
+      feeQuote,
+      grid: -1,
+      cyclePnl,
+      basis: slot.entryQuote,
+      reason: "trail",
+    });
+  };
+
+  /** OKX trailing up: drop the bottom buy, shift every level up one spacing, buy the new top. */
+  const shiftUp = (price: number, t: number): boolean => {
+    if (trailUpCap == null || !(qty > 0)) return false;
+    const nextUpper = params.mode === "arithmetic" ? upper + arithStep : upper * geoRatio;
+    if (!(nextUpper > upper) || nextUpper > trailUpCap + 1e-8) return false;
+    const dropped = slots[0];
+    const freed =
+      dropped && dropped.side === "sell" && dropped.baseQty > 0
+        ? dropped.baseQty * price * (1 - feeRate)
+        : 0;
+    if (!(cash + freed + 1e-8 >= qty * price)) return false;
+    slots.shift();
+    if (dropped) closeDropped(dropped, price, t);
+    if (params.mode === "arithmetic") {
+      for (let i = 0; i < levels.length; i++) levels[i] += arithStep;
+    } else {
+      for (let i = 0; i < levels.length; i++) levels[i] *= geoRatio;
+    }
+    lower = levels[0];
+    upper = levels[levels.length - 1];
+    slots.push({ side: "buy", entryPrice: 0, entryQuote: 0, baseQty: 0 });
+    buy(slots.length - 1, price, t, "trail");
+    if (stopLoss != null) {
+      stopLoss = params.mode === "arithmetic" ? stopLoss + arithStep : stopLoss * geoRatio;
+    }
+    if (trailDownFloor != null) {
+      trailDownFloor = params.mode === "arithmetic" ? trailDownFloor + arithStep : trailDownFloor * geoRatio;
+      if (!(trailDownFloor < lower)) trailDownFloor = null;
+    }
+    trailUpCount += 1;
+    return true;
+  };
+
+  /** OKX trailing down: extend the floor by one spacing. Upper limit stays. Extra quote is funded and counted. */
+  const extendDown = (t: number): boolean => {
+    if (trailDownFloor == null || !(qty > 0) || grids >= 200) return false;
+    const nextLower = params.mode === "arithmetic" ? lower - arithStep : lower / geoRatio;
+    if (!(nextLower > 0) || !(nextLower < lower) || nextLower + 1e-8 < trailDownFloor) return false;
+    if (stopLoss != null && nextLower <= stopLoss) return false;
+    const cost = qty * nextLower;
+    if (!(cash + 1e-8 >= cost)) {
+      const need = cost - cash;
+      extraCapital += need;
+      cash += need;
+    }
+    levels.unshift(nextLower);
+    lower = nextLower;
+    grids += 1;
+    slots.unshift({ side: "buy", entryPrice: 0, entryQuote: 0, baseQty: 0 });
+    buy(0, nextLower, t, "trail");
+    trailDownCount += 1;
+    return true;
+  };
+
+  const trailUpAlong = (b: number, t: number) => {
+    let guard = 0;
+    while (!stopped && trailUpCap != null && b >= upper && guard < 80) {
+      guard += 1;
+      const at = upper;
+      if (!shiftUp(at, t)) break;
+      const top = slots.length - 1;
+      if (b >= upper && slots[top]?.side === "sell") sellSlot(top, upper, t);
+    }
+  };
+
+  const trailDownAlong = (b: number, t: number) => {
+    let guard = 0;
+    while (!stopped && trailDownFloor != null && b <= lower && guard < 80) {
+      guard += 1;
+      if (!extendDown(t)) break;
+    }
+  };
+
+  const move = (a: number, b: number, t: number) => {
+    if (stopped || !(qty > 0) || a === b) return;
+    if (b > a) {
+      const cap = Math.min(b, upper);
+      if (cap > a) cross(a, cap, t);
+      if (!stopped && b >= upper) trailUpAlong(b, t);
+      if (!stopped && takeProfit != null && b >= takeProfit) liquidate(takeProfit, t, "tp");
+      return;
+    }
+    const floor = Math.max(b, lower);
+    if (floor < a) cross(a, floor, t);
+    if (!stopped && b <= lower) trailDownAlong(b, t);
+    if (!stopped && stopLoss != null && b <= stopLoss) liquidate(stopLoss, t, "sl");
   };
 
   let cursor = candles[0].o;
@@ -461,15 +601,15 @@ export function runBacktest(candles: Candle[], params: GridParams): BacktestResu
         const entry = enterPrice(a, b);
         if (entry == null) continue;
         activate(entry, candle.t);
-        if (entry !== b) cross(entry, b, candle.t);
+        if (entry !== b) move(entry, b, candle.t);
       } else {
-        cross(a, b, candle.t);
+        move(a, b, candle.t);
       }
     }
 
     cursor = candle.c;
     const price = candle.c;
-    const eq = active ? cash + btc * price : investment;
+    const eq = active ? cash + btc * price - extraCapital : investment;
     const hold = active && activationPrice ? holdQty * price : investment;
     equity.push({ t: candle.t, equity: eq, hold, price, cash: active ? cash : investment, btc });
     if (active) {
@@ -539,7 +679,10 @@ export function runBacktest(candles: Candle[], params: GridParams): BacktestResu
       minGridReturn: returns.min,
       maxGridReturn: returns.max,
       openSlots,
-      levels,
+      levels: [...levels],
+      trailUpCount,
+      trailDownCount,
+      extraCapital,
     },
   };
 }

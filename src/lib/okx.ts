@@ -30,7 +30,7 @@ async function okxRows(url: string): Promise<string[][]> {
   let res: Response;
   try {
     res = await fetch(url, {
-      headers: { accept: "application/json" },
+      headers: { accept: "application/json", "user-agent": "Mozilla/5.0 MailleBacktest" },
       signal: AbortSignal.timeout(20_000),
     });
   } catch {
@@ -54,7 +54,7 @@ async function loadCandles(bar: OkxBar, limit: number): Promise<Candle[]> {
   }
 
   let guard = 0;
-  while (collected.length < want && guard < 40) {
+  while (collected.length < want && guard < 130) {
     guard += 1;
     const oldest = collected[collected.length - 1];
     if (!oldest) break;
@@ -87,7 +87,7 @@ export const fetchOkxCandles = createServerFn({ method: "GET" })
     if (!input || !BARS.includes(input.bar)) throw new Error("Unité de temps invalide.");
     const limit = Math.floor(Number(input.limit));
     if (!Number.isFinite(limit)) throw new Error("Période invalide.");
-    return { bar: input.bar, limit: Math.max(80, Math.min(2500, limit)) };
+    return { bar: input.bar, limit: Math.max(80, Math.min(10_000, limit)) };
   })
   .handler(async ({ data }): Promise<CandlePack> => {
     const key = `${data.bar}:${data.limit}`;
